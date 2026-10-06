@@ -19,6 +19,7 @@ import {
   FACTORY_ROUTE,
 } from './config.js';
 import { decodeFunctionResult, encodeFunctionData, parseAbi } from 'viem';
+import { createEVMClient } from '@metamask/connect-evm';
 import './styles.css';
 
 function money(value, digits = 2) {
@@ -852,6 +853,51 @@ function RobinhoodDirectSwap({ destination, sourceToken, onQuote, onFinished, on
 
 
 
+
+let metamaskConnectClientPromise = null;
+
+function metamaskSupportedNetworks() {
+  return {
+    '0x1': 'https://ethereum-rpc.publicnode.com',
+    '0xa': 'https://mainnet.optimism.io',
+    '0x38': 'https://bsc-dataseed.binance.org',
+    '0x89': 'https://polygon-rpc.com',
+    '0x2105': 'https://mainnet.base.org',
+    '0xa4b1': 'https://arb1.arbitrum.io/rpc',
+    '0xa86a': 'https://api.avax.network/ext/bc/C/rpc',
+    '0xe708': 'https://rpc.linea.build',
+    '0x13e31': 'https://rpc.blast.io',
+    '0x82750': 'https://rpc.scroll.io',
+    '0x1237': ROUTING.robinhoodWalletRpc || 'https://rpc.mainnet.chain.robinhood.com',
+  };
+}
+
+async function getMetaMaskConnectClient() {
+  if (!metamaskConnectClientPromise) {
+    metamaskConnectClientPromise = createEVMClient({
+      dapp: {
+        name: 'The Cuck Factory',
+        url: window.location.origin + window.location.pathname,
+      },
+      api: {
+        supportedNetworks: metamaskSupportedNetworks(),
+      },
+    });
+  }
+  return metamaskConnectClientPromise;
+}
+
+async function connectMetaMaskUniversal() {
+  const client = await getMetaMaskConnectClient();
+  const result = await client.connect({ chainIds: ['0x1237'] });
+  const provider = client.getProvider();
+  const address = result?.accounts?.[0] || '';
+  if (!provider?.request || !isEvmAddress(address)) {
+    throw new Error('MetaMask connection did not return an EVM account.');
+  }
+  return { provider, address, label: 'MetaMask' };
+}
+
 function discoverEvmWallets() {
   return new Promise((resolve) => {
     const found = new Map();
@@ -1026,6 +1072,54 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
     }
   };
 
+  const connectUniversal = async () => {
+    setError('');
+    setState('connecting');
+
+    try {
+      // Desktop: prefer an injected MetaMask provider when present.
+      const discovered = walletChoices.length ? walletChoices : await discoverEvmWallets();
+      const injected = discovered.find((choice) => choice.label === 'MetaMask')
+        || discovered.find((choice) => !/phantom/i.test(choice.label));
+
+      if (injected?.provider?.request) {
+        const address = await connectChoice(injected);
+        if (address) setState('idle');
+        return address;
+      }
+
+      // Mobile Safari/Chrome: MetaMask Connect deeplinks into the mobile app,
+      // then returns a persistent EIP-1193 provider/session to this page.
+      const connected = await connectMetaMaskUniversal();
+      walletProviderRef.current = connected.provider;
+      setWalletLabel(connected.label);
+      setAccount(connected.address);
+      onWalletConnected?.({ address: connected.address });
+
+      try {
+        await ensureEvmChain(connected.provider, CUCK.chainId);
+        const balanceHex = await connected.provider.request({
+          method: 'eth_getBalance',
+          params: [connected.address, 'latest'],
+        });
+        const balance = Number(formatUnits(BigInt(balanceHex || '0x0').toString(), 18, 10));
+        setFallbackBalance(balance);
+        if (!sourceToken && balance > 0) {
+          setAmount(String(Number((balance * 0.95).toPrecision(10))));
+        }
+      } catch {
+        // Connection succeeded; chain/balance can still be selected later.
+      }
+
+      setState('idle');
+      return connected.address;
+    } catch (err) {
+      setState('error');
+      setError(err?.message || 'Wallet connection failed.');
+      return '';
+    }
+  };
+
   useEffect(() => {
     const numeric = Number(amount || 0);
 
@@ -1095,7 +1189,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
     if (!quoteBody?.transactionRequest || !token) return;
 
     let signer = account;
-    if (!isEvmAddress(signer)) signer = await connect();
+    if (!isEvmAddress(signer)) signer = await connectUniversal();
     if (!isEvmAddress(signer)) return;
 
     setState('executing');
@@ -1176,30 +1270,30 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
   const routeName = quoteBody?.toolDetails?.name || quoteBody?.tool || 'LI.FI';
 
   if (!isEvmAddress(account)) {
-    const preferred = walletChoices.find((choice) => choice.label === 'MetaMask')
-      || walletChoices.find((choice) => !/phantom/i.test(choice.label))
-      || null;
-
     return (
-      <section className="direct-swap">
+      <section className="direct-swap mobile-connect-card">
         <div className="swap-heading">
           <strong>CONNECT WALLET</strong>
-          <span>We find your EVM leftovers. $CUCK is always the output.</span>
+          <span>One tap on desktop or mobile. We find the leftovers; $CUCK stays locked as the output.</span>
         </div>
 
-        {preferred ? (
-          <button type="button" className="direct-recycle" onClick={() => connectChoice(preferred)}>
-            CONNECT {preferred.label.toUpperCase()}
-          </button>
-        ) : (
-          <div className="factory-finish-error">No EVM wallet found. Install MetaMask and refresh.</div>
-        )}
+        <button
+          type="button"
+          className="direct-recycle mobile-connect-button"
+          onClick={connectUniversal}
+          disabled={state === 'connecting'}
+        >
+          {state === 'connecting' ? 'OPENING WALLET…' : 'CONNECT WALLET'}
+        </button>
+
+        <small className="mobile-connect-help">
+          On iPhone this opens MetaMask and returns you to the swap after approval.
+        </small>
 
         {error ? <div className="factory-finish-error">{error}</div> : null}
       </section>
     );
   }
-
 
   return (
     <section className="direct-swap">
