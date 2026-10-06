@@ -21,6 +21,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Create source package
+        run: |
+          zip -qr cuckfactory-swap-source.zip . -x ".git/*" "node_modules/*" "dist/*" "cuckfactory-swap-source.zip"
+
+      - name: Upload source package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuckfactory-swap-source
+          path: cuckfactory-swap-source.zip
+          retention-days: 7
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
