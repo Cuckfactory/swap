@@ -484,53 +484,104 @@ function defaultRecycleAmount(holding) {
   return String(Number((balance * multiplier).toPrecision(10)));
 }
 
-async function scanConnectedWallet({ evmAddress, solanaAddress }) {
-  const jobs = [];
-  if (isEvmAddress(evmAddress)) {
-    EVM_SCAN_BATCHES.forEach((networks) => jobs.push(fetchAlchemyTokenBatch(evmAddress, networks)));
-  }
-  if (looksLikeSolanaAddress(solanaAddress)) jobs.push(fetchAlchemyTokenBatch(solanaAddress, ['sol-mainnet']));
-  if (!jobs.length) return [];
+async function rpcCallUrl(url, method, params = []) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+  });
+  if (!response.ok) throw new Error(`RPC ${response.status}`);
+  const json = await response.json();
+  if (json?.error) throw new Error(json.error.message || 'RPC error');
+  return json?.result;
+}
 
-  const settled = await Promise.allSettled(jobs);
-  let holdings = settled
+async function scanNativeEvmBalances(address) {
+  if (!isEvmAddress(address)) return [];
+
+  const entries = Object.entries(EVM_CHAIN_META);
+  const settled = await Promise.allSettled(entries.map(async ([chainIdText, meta]) => {
+    const chainId = Number(chainIdText);
+    const rpcUrl = meta?.rpcUrls?.[0];
+    if (!rpcUrl) return null;
+
+    const rawHex = await rpcCallUrl(rpcUrl, 'eth_getBalance', [address, 'latest']);
+    const raw = BigInt(rawHex || '0x0');
+    if (raw <= 0n) return null;
+
+    const decimals = Number(meta?.nativeCurrency?.decimals || 18);
+    const balance = Number(formatUnits(raw.toString(), decimals, 10));
+    if (!Number.isFinite(balance) || balance <= 0) return null;
+
+    return {
+      id: `${chainId}:0x0000000000000000000000000000000000000000`,
+      chainId,
+      chainLabel: meta.chainName || `Chain ${chainId}`,
+      tokenAddress: '0x0000000000000000000000000000000000000000',
+      symbol: meta?.nativeCurrency?.symbol || 'ETH',
+      name: meta?.nativeCurrency?.name || meta?.nativeCurrency?.symbol || 'Native token',
+      logo: '',
+      balance,
+      rawBalance: raw.toString(),
+      decimals,
+      usd: 0,
+    };
+  }));
+
+  return settled
+    .filter((item) => item.status === 'fulfilled' && item.value)
+    .map((item) => item.value);
+}
+
+async function scanConnectedWallet({ evmAddress, solanaAddress }) {
+  const portfolioJobs = [];
+  if (isEvmAddress(evmAddress)) {
+    EVM_SCAN_BATCHES.forEach((networks) => portfolioJobs.push(fetchAlchemyTokenBatch(evmAddress, networks)));
+  }
+  if (looksLikeSolanaAddress(solanaAddress)) {
+    portfolioJobs.push(fetchAlchemyTokenBatch(solanaAddress, ['sol-mainnet']));
+  }
+
+  const [portfolioSettled, nativeHoldings] = await Promise.all([
+    Promise.allSettled(portfolioJobs),
+    isEvmAddress(evmAddress) ? scanNativeEvmBalances(evmAddress) : Promise.resolve([]),
+  ]);
+
+  const portfolioHoldings = portfolioSettled
     .flatMap((item) => item.status === 'fulfilled' ? item.value : [])
     .map(normalizeHolding)
     .filter(Boolean);
 
-  // Portfolio indexing can lag on a brand-new chain. Always read native ETH on Robinhood directly.
-  if (isEvmAddress(evmAddress) && !holdings.some((item) => item.chainId === FACTORY_ROUTE.bridgeToken.chainId && item.symbol === 'ETH')) {
-    try {
-      const balance = await robinhoodTokenBalance(evmAddress, ROUTING.robinhoodNativeToken);
-      if (balance?.raw > 0n) {
-        const usd = await quoteRobinhoodUsd(ROUTING.robinhoodNativeToken, balance.raw);
-        holdings.push({
-          id: `${FACTORY_ROUTE.bridgeToken.chainId}:${ROUTING.robinhoodNativeToken}`,
-          chainId: FACTORY_ROUTE.bridgeToken.chainId,
-          chainLabel: 'Robinhood Chain',
-          tokenAddress: ROUTING.robinhoodNativeToken,
-          symbol: 'ETH',
-          name: 'Ethereum',
-          logo: '',
-          balance: Number(formatUnits(balance.raw.toString(), 18, 10)),
-          rawBalance: balance.raw.toString(),
-          decimals: 18,
-          usd,
-        });
-      }
-    } catch {}
-  }
-
-  holdings = holdings
-    .filter((item) => item.usd >= 0.25 || (item.chainId === FACTORY_ROUTE.bridgeToken.chainId && item.balance > 0))
-    .sort((a, b) => leftoverRank(a.usd) - leftoverRank(b.usd) || b.usd - a.usd);
+  let holdings = [...nativeHoldings, ...portfolioHoldings];
 
   const seen = new Set();
-  return holdings.filter((item) => {
+  holdings = holdings.filter((item) => {
+    if (!item || item.balance <= 0) return false;
+    if (String(item.tokenAddress).toLowerCase() === CUCK.address.toLowerCase()) return false;
     if (seen.has(item.id)) return false;
     seen.add(item.id);
     return true;
   });
+
+  // Native balances are useful even when a price indexer is unavailable.
+  holdings.sort((a, b) => {
+    const aPriced = a.usd > 0 ? 1 : 0;
+    const bPriced = b.usd > 0 ? 1 : 0;
+    if (aPriced !== bPriced) return bPriced - aPriced;
+    if (a.usd !== b.usd) return b.usd - a.usd;
+    return b.balance - a.balance;
+  });
+
+  const allPortfolioFailed = portfolioJobs.length > 0
+    && portfolioSettled.length > 0
+    && portfolioSettled.every((item) => item.status === 'rejected');
+
+  if (!holdings.length && allPortfolioFailed) {
+    const firstFailure = portfolioSettled.find((item) => item.status === 'rejected');
+    throw new Error(firstFailure?.reason?.message || 'Token scan unavailable');
+  }
+
+  return holdings;
 }
 
 function getRouteUsd(route, side) {
@@ -889,7 +940,7 @@ async function getMetaMaskConnectClient() {
 
 async function connectMetaMaskUniversal() {
   const client = await getMetaMaskConnectClient();
-  const result = await client.connect({ chainIds: ['0x1'] });
+  const result = await client.connect({ chainIds: ['0x1'], forceRequest: true });
   const provider = client.getProvider();
   const address = result?.accounts?.[0] || '';
   if (!provider?.request || !isEvmAddress(address)) {
@@ -1000,7 +1051,7 @@ async function providerApprove(provider, from, token, spender, amount) {
 }
 
 
-function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], holdingsLoading = false, holdingsError = '', onSelectHolding, onWalletConnected, onQuote, onFinished }) {
+function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], holdingsLoading = false, holdingsError = '', onSelectHolding, onWalletConnected, onWalletDisconnected, onQuote, onFinished }) {
   const walletProviderRef = React.useRef(null);
   const [walletChoices, setWalletChoices] = useState([]);
   const [walletLabel, setWalletLabel] = useState('');
@@ -1029,10 +1080,10 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
     decimals: 18,
     usd: 0,
   };
-  const token = sourceToken || fallbackToken;
-  const chainId = Number(token.chainId);
-  const tokenAddress = token.tokenAddress;
-  const tokenDecimals = token.decimals ?? 18;
+  const token = sourceToken || (fallbackBalance > 0 ? fallbackToken : null);
+  const chainId = Number(token?.chainId || 0);
+  const tokenAddress = token?.tokenAddress || '';
+  const tokenDecimals = token?.decimals ?? 18;
   const isNative = sameAddress(tokenAddress, '0x0000000000000000000000000000000000000000');
 
   useEffect(() => {
@@ -1113,6 +1164,26 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
       setError(err?.message || 'Wallet connection failed.');
       return '';
     }
+  };
+
+
+  const disconnectCurrent = async () => {
+    try {
+      if (/metamask/i.test(walletLabel || '')) {
+        const client = await getMetaMaskConnectClient();
+        await client.disconnect().catch(() => {});
+      }
+    } catch {}
+
+    walletProviderRef.current = null;
+    setWalletLabel('');
+    setAccount('');
+    setFallbackBalance(0);
+    setAmount('');
+    setQuoteBody(null);
+    setState('idle');
+    setError('');
+    onWalletDisconnected?.();
   };
 
 
@@ -1324,6 +1395,48 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
       </section>
     );
   }
+  if (!token) {
+    return (
+      <section className="direct-swap">
+        <div className="swap-heading">
+          <strong>{holdingsLoading ? 'SCANNING WALLET…' : 'NO BAG SELECTED'}</strong>
+          <span>Connected as {shortAddress(account)}. We only show balances we can actually verify.</span>
+        </div>
+
+        <div className="direct-wallet">
+          <span>✓ {shortAddress(account)} · {walletLabel || 'Connected wallet'}</span>
+          <button type="button" className="change-wallet-button" onClick={disconnectCurrent}>CHANGE WALLET</button>
+        </div>
+
+        {holdings.length ? (
+          <div className="bag-picker">
+            <span>YOUR BAGS</span>
+            <div className="bag-picker-list">
+              {holdings.slice(0, 8).map((item) => (
+                <button type="button" key={item.id} onClick={() => onSelectHolding?.(item)}>
+                  <b>{item.symbol}</b>
+                  <small>{item.usd > 0 ? money(item.usd) : `${item.balance.toLocaleString('en-US', { maximumFractionDigits: 6 })} · ${item.chainLabel}`}</small>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="scan-status">
+            {holdingsLoading
+              ? 'Looking for balances across supported EVM chains…'
+              : holdingsError
+                ? `Token scan failed: ${holdingsError}`
+                : 'No supported balance found for this address yet.'}
+          </div>
+        )}
+
+        <small className="direct-note">
+          We no longer default to Robinhood ETH when its balance is zero.
+        </small>
+      </section>
+    );
+  }
+
 
   return (
     <section className="direct-swap">
@@ -1332,7 +1445,10 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
         <span>{token.chainLabel} → $CUCK on Robinhood. One quote, one wallet transaction.</span>
       </div>
 
-      <div className="direct-wallet">✓ {shortAddress(account)} · {walletLabel || 'Connected wallet'}</div>
+      <div className="direct-wallet">
+        <span>✓ {shortAddress(account)} · {walletLabel || 'Connected wallet'}</span>
+        <button type="button" className="change-wallet-button" onClick={disconnectCurrent}>CHANGE WALLET</button>
+      </div>
 
       <div className="bag-picker">
         <span>YOUR BAGS</span>
@@ -1989,6 +2105,18 @@ function App() {
     }));
   };
 
+  const handleWalletDisconnected = () => {
+    setWallets({ evmAddress: '', solanaAddress: '' });
+    setHoldings([]);
+    setHoldingsError('');
+    setHoldingsLoading(false);
+    setSelectedHolding(null);
+    setSourceForm({ chainId: null, tokenAddress: '', fromAmount: '' });
+    setQuote(null);
+    setResult(null);
+    setStatus('idle');
+  };
+
   const connectForScan = async () => {
     setWalletConnectError('');
     try {
@@ -2216,6 +2344,7 @@ function App() {
               holdingsError={holdingsError}
               onSelectHolding={handleHoldingSelected}
               onWalletConnected={handleWalletConnected}
+              onWalletDisconnected={handleWalletDisconnected}
               onQuote={setQuote}
               onFinished={handleFactoryFinished}
             />
