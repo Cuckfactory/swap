@@ -851,34 +851,119 @@ function RobinhoodDirectSwap({ destination, sourceToken, onQuote, onFinished, on
 }
 
 
-function RobinhoodCuckSwap({ destination, wallet, onWalletConnected, onQuote, onFinished, onUseOtherChain }) {
+
+function getPreferredEvmProvider() {
+  const injected = window.ethereum;
+  const providers = Array.isArray(injected?.providers) ? injected.providers : [];
+
+  // Prefer MetaMask explicitly when multiple EVM providers are injected
+  // (e.g. MetaMask + Phantom in the same browser).
+  return providers.find((provider) => provider?.isMetaMask && !provider?.isPhantom)
+    || providers.find((provider) => provider?.isMetaMask)
+    || providers.find((provider) => !provider?.isPhantom)
+    || injected
+    || null;
+}
+
+const EVM_CHAIN_META = {
+  1: { chainName: 'Ethereum', rpcUrls: ['https://ethereum-rpc.publicnode.com'], nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 } },
+  10: { chainName: 'Optimism', rpcUrls: ['https://mainnet.optimism.io'], nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 } },
+  56: { chainName: 'BNB Smart Chain', rpcUrls: ['https://bsc-dataseed.binance.org'], nativeCurrency: { name: 'BNB', symbol: 'BNB', decimals: 18 } },
+  137: { chainName: 'Polygon', rpcUrls: ['https://polygon-rpc.com'], nativeCurrency: { name: 'POL', symbol: 'POL', decimals: 18 } },
+  8453: { chainName: 'Base', rpcUrls: ['https://mainnet.base.org'], nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 } },
+  42161: { chainName: 'Arbitrum One', rpcUrls: ['https://arb1.arbitrum.io/rpc'], nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 } },
+  43114: { chainName: 'Avalanche C-Chain', rpcUrls: ['https://api.avax.network/ext/bc/C/rpc'], nativeCurrency: { name: 'AVAX', symbol: 'AVAX', decimals: 18 } },
+  59144: { chainName: 'Linea', rpcUrls: ['https://rpc.linea.build'], nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 } },
+  81457: { chainName: 'Blast', rpcUrls: ['https://rpc.blast.io'], nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 } },
+  534352: { chainName: 'Scroll', rpcUrls: ['https://rpc.scroll.io'], nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 } },
+  4663: { chainName: 'Robinhood Chain', rpcUrls: [ROUTING.robinhoodWalletRpc || 'https://rpc.mainnet.chain.robinhood.com'], nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 } },
+};
+
+async function ensureEvmChain(provider, chainId) {
+  if (!provider?.request) throw new Error('No EVM wallet detected.');
+  const target = `0x${Number(chainId).toString(16)}`;
+  const current = await provider.request({ method: 'eth_chainId' }).catch(() => '');
+  if (String(current).toLowerCase() === target.toLowerCase()) return;
+
+  try {
+    await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: target }] });
+  } catch (error) {
+    if (error?.code !== 4902) throw error;
+    const meta = EVM_CHAIN_META[Number(chainId)];
+    if (!meta) throw new Error(`Add chain ${chainId} to your wallet and try again.`);
+    await provider.request({
+      method: 'wallet_addEthereumChain',
+      params: [{ chainId: target, ...meta }],
+    });
+  }
+}
+
+async function waitForProviderReceipt(provider, txHash, attempts = 100) {
+  for (let i = 0; i < attempts; i += 1) {
+    const receipt = await provider.request({ method: 'eth_getTransactionReceipt', params: [txHash] });
+    if (receipt) {
+      if (receipt.status && receipt.status !== '0x1') throw new Error('Transaction reverted.');
+      return receipt;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 1500));
+  }
+  throw new Error('Transaction confirmation timed out.');
+}
+
+async function providerAllowance(provider, token, owner, spender) {
+  const data = encodeFunctionData({ abi: ERC20_ABI, functionName: 'allowance', args: [owner, spender] });
+  const result = await provider.request({
+    method: 'eth_call',
+    params: [{ to: token, data }, 'latest'],
+  });
+  return BigInt(decodeFunctionResult({ abi: ERC20_ABI, functionName: 'allowance', data: result }) || 0);
+}
+
+async function providerApprove(provider, from, token, spender, amount) {
+  const data = encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [spender, amount] });
+  const txHash = await provider.request({
+    method: 'eth_sendTransaction',
+    params: [{ from, to: token, data }],
+  });
+  await waitForProviderReceipt(provider, txHash);
+  return txHash;
+}
+
+
+function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected, onQuote, onFinished, onUseSolana }) {
   const [account, setAccount] = useState(isEvmAddress(wallet) ? wallet : '');
-  const [amount, setAmount] = useState('');
-  const [balanceRaw, setBalanceRaw] = useState(0n);
+  const [amount, setAmount] = useState(sourceToken ? defaultRecycleAmount(sourceToken) : '');
   const [quoteBody, setQuoteBody] = useState(null);
   const [state, setState] = useState('idle');
   const [error, setError] = useState('');
+
+  const token = sourceToken || null;
+  const chainId = Number(token?.chainId || 0);
+  const tokenAddress = token?.tokenAddress || '';
+  const tokenDecimals = token?.decimals ?? 18;
+  const isNative = sameAddress(tokenAddress, '0x0000000000000000000000000000000000000000');
 
   useEffect(() => {
     if (isEvmAddress(wallet)) setAccount(wallet);
   }, [wallet]);
 
-  const tokenAddress = ROUTING.robinhoodNativeToken;
-  const humanBalance = Number(formatUnits(balanceRaw.toString(), 18, 8));
+  useEffect(() => {
+    setAmount(token ? defaultRecycleAmount(token) : '');
+    setQuoteBody(null);
+    setState('idle');
+    setError('');
+  }, [token?.id]);
 
   const connect = async () => {
+    setError('');
     try {
-      const provider = window.ethereum;
-      if (!provider?.request) throw new Error('No EVM wallet detected.');
-      await ensureRobinhoodWallet(provider);
+      const provider = getPreferredEvmProvider();
+      if (!provider?.request) throw new Error('MetaMask or another EVM wallet was not found.');
       const accounts = await provider.request({ method: 'eth_requestAccounts' });
       const address = accounts?.[0] || '';
       if (!isEvmAddress(address)) throw new Error('No EVM wallet connected.');
       setAccount(address);
       onWalletConnected?.({ address });
-      const bal = await robinhoodTokenBalance(address, tokenAddress);
-      if (bal) setBalanceRaw(bal.raw);
-      setError('');
       return address;
     } catch (err) {
       setError(err?.message || 'Wallet connection failed.');
@@ -887,102 +972,142 @@ function RobinhoodCuckSwap({ destination, wallet, onWalletConnected, onQuote, on
   };
 
   useEffect(() => {
-    if (!isEvmAddress(account)) return;
-    robinhoodTokenBalance(account, tokenAddress).then((bal) => {
-      if (bal) setBalanceRaw(bal.raw);
-    }).catch(() => {});
-  }, [account]);
-
-  useEffect(() => {
     const numeric = Number(amount || 0);
-    if (!numeric || numeric <= 0) {
+
+    if (!token || !chainId || !tokenAddress || !numeric || numeric <= 0 || !isEvmAddress(account)) {
       setQuoteBody(null);
-      setState('idle');
-      setError('');
+      if (!token || !numeric) setState('idle');
       return;
     }
-    const fromAddress = isEvmAddress(account) ? account : (isEvmAddress(destination) ? destination : '');
-    if (!isEvmAddress(fromAddress)) {
-      setQuoteBody(null);
-      setState('need-wallet');
-      return;
-    }
+
     let cancelled = false;
     const timer = window.setTimeout(async () => {
       setState('quoting');
       setError('');
+      setQuoteBody(null);
+
       try {
-        const rawAmount = decimalToRaw(amount, 18);
-        const recipient = isEvmAddress(destination) ? destination : fromAddress;
+        const recipient = isEvmAddress(destination) ? destination : account;
+        const rawAmount = decimalToRaw(amount, tokenDecimals);
         const params = new URLSearchParams({
-          fromChain: String(CUCK.chainId),
+          fromChain: String(chainId),
           toChain: String(CUCK.chainId),
           fromToken: tokenAddress,
           toToken: CUCK.address,
           fromAmount: rawAmount,
-          fromAddress,
+          fromAddress: account,
           toAddress: recipient,
           slippage: '0.03',
+          integrator: 'cuck-factory-bag-recycler',
         });
+
         const response = await fetch(`https://li.quest/v1/quote?${params.toString()}`);
         const body = await response.json().catch(() => null);
         if (cancelled) return;
+
         if (!response.ok || !body?.transactionRequest) {
-          throw new Error(body?.message || 'No executable route for this amount.');
+          throw new Error(body?.message || body?.error?.message || 'No executable LI.FI route for this bag.');
         }
+
         setQuoteBody(body);
         setState('ready');
-        const fromUsd = Number(body?.action?.fromToken?.priceUSD || 0) * numeric;
-        const toHuman = Number(formatUnits(body?.estimate?.toAmount || '0', body?.action?.toToken?.decimals ?? 18, 8));
-        const toUsd = Number(body?.action?.toToken?.priceUSD || 0) * toHuman;
+
+        const fromPrice = Number(body?.action?.fromToken?.priceUSD || 0);
+        const fromUsd = fromPrice > 0
+          ? fromPrice * numeric
+          : (token.usd > 0 && token.balance > 0 ? token.usd * (numeric / token.balance) : 0);
+
+        const toDecimals = body?.action?.toToken?.decimals ?? 18;
+        const toHuman = Number(formatUnits(body?.estimate?.toAmount || '0', toDecimals, 10));
+        const toPrice = Number(body?.action?.toToken?.priceUSD || 0);
+        const toUsd = toPrice > 0 ? toPrice * toHuman : fromUsd;
+
         onQuote?.({ fromUsd, toUsd: toUsd || fromUsd });
       } catch (err) {
         if (cancelled) return;
-        setQuoteBody(null);
         setState('error');
         setError(err?.message || 'Quote failed.');
       }
     }, 350);
-    return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [amount, account, destination]);
 
-  const setPct = (pct) => {
-    if (!humanBalance) return;
-    const value = pct >= 1 ? humanBalance * 0.97 : humanBalance * pct;
-    setAmount(String(Number(value.toPrecision(8))));
-  };
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [amount, account, destination, token?.id, chainId, tokenAddress, tokenDecimals]);
 
   const execute = async () => {
-    if (!quoteBody?.transactionRequest) return;
-    const signer = account || await connect();
-    if (!signer) return;
+    if (!quoteBody?.transactionRequest || !token) return;
+
+    let signer = account;
+    if (!isEvmAddress(signer)) signer = await connect();
+    if (!isEvmAddress(signer)) return;
+
     setState('executing');
     setError('');
+
     try {
-      const provider = window.ethereum;
+      const provider = getPreferredEvmProvider();
       if (!provider?.request) throw new Error('No EVM wallet detected.');
-      await ensureRobinhoodWallet(provider);
+
+      await ensureEvmChain(provider, chainId);
+
+      const accounts = await provider.request({ method: 'eth_requestAccounts' });
+      const active = accounts?.[0] || '';
+      if (!isEvmAddress(active)) throw new Error('No EVM wallet connected.');
+      if (active.toLowerCase() !== signer.toLowerCase()) {
+        throw new Error(`Connect ${shortAddress(signer)} to recycle this bag.`);
+      }
+
+      const approvalAddress = quoteBody?.estimate?.approvalAddress;
+      if (!isNative && isEvmAddress(approvalAddress)) {
+        const rawAmount = BigInt(decimalToRaw(amount, tokenDecimals));
+        const allowance = await providerAllowance(provider, tokenAddress, active, approvalAddress);
+        if (allowance < rawAmount) {
+          await providerApprove(provider, active, tokenAddress, approvalAddress, rawAmount);
+        }
+      }
+
       const req = quoteBody.transactionRequest;
-      const tx = { from: signer, to: req.to, data: req.data || '0x', value: req.value || '0x0' };
+      const tx = {
+        from: active,
+        to: req.to,
+        data: req.data || '0x',
+        value: req.value || '0x0',
+      };
       if (req.gasLimit) tx.gas = req.gasLimit;
       else if (req.gas) tx.gas = req.gas;
+      if (req.gasPrice) tx.gasPrice = req.gasPrice;
+      if (req.maxFeePerGas) tx.maxFeePerGas = req.maxFeePerGas;
+      if (req.maxPriorityFeePerGas) tx.maxPriorityFeePerGas = req.maxPriorityFeePerGas;
+
       const txHash = await provider.request({ method: 'eth_sendTransaction', params: [tx] });
-      await waitForReceipt(txHash);
+      await waitForProviderReceipt(provider, txHash);
+
       const toDecimals = quoteBody?.action?.toToken?.decimals ?? 18;
       const toAmount = quoteBody?.estimate?.toAmount || '0';
       const numeric = Number(amount || 0);
-      const fromUsd = Number(quoteBody?.action?.fromToken?.priceUSD || 0) * numeric;
-      const toHuman = Number(formatUnits(toAmount, toDecimals, 8));
-      const toUsd = Number(quoteBody?.action?.toToken?.priceUSD || 0) * toHuman;
+
+      const fromPrice = Number(quoteBody?.action?.fromToken?.priceUSD || 0);
+      const fromUsd = fromPrice > 0
+        ? fromPrice * numeric
+        : (token.usd > 0 && token.balance > 0 ? token.usd * (numeric / token.balance) : 0);
+
+      const toHuman = Number(formatUnits(toAmount, toDecimals, 10));
+      const toPrice = Number(quoteBody?.action?.toToken?.priceUSD || 0);
+      const toUsd = toPrice > 0 ? toPrice * toHuman : fromUsd;
+
       onFinished?.({
         fromUsd,
         toUsd: toUsd || fromUsd,
         cuckAmount: formatUnits(toAmount, toDecimals, 4),
-        fromSymbol: 'ETH',
+        fromSymbol: token.symbol || 'TOKEN',
         fromAmount: amount,
-        destination: isEvmAddress(destination) ? destination : signer,
+        destination: isEvmAddress(destination) ? destination : active,
         txHash,
+        pendingCrossChain: chainId !== CUCK.chainId,
       });
+
       setState('done');
     } catch (err) {
       setState('error');
@@ -993,27 +1118,81 @@ function RobinhoodCuckSwap({ destination, wallet, onWalletConnected, onQuote, on
   const expected = quoteBody
     ? formatUnits(quoteBody?.estimate?.toAmount || '0', quoteBody?.action?.toToken?.decimals ?? 18, 4)
     : '—';
+  const routeName = quoteBody?.toolDetails?.name || quoteBody?.tool || 'LI.FI';
+
+  if (!isEvmAddress(account)) {
+    return (
+      <section className="direct-swap">
+        <div className="swap-heading">
+          <strong>CONNECT WALLET</strong>
+          <span>We scan the same address across supported EVM chains and show the leftovers.</span>
+        </div>
+        <button type="button" className="direct-recycle" onClick={connect}>CONNECT METAMASK</button>
+        {error ? <div className="factory-finish-error">{error}</div> : null}
+        <button type="button" className="direct-other" onClick={onUseSolana}>SOLANA / MANUAL TOKEN →</button>
+      </section>
+    );
+  }
+
+  if (!token) {
+    return (
+      <section className="direct-swap">
+        <div className="swap-heading">
+          <strong>FINDING YOUR LEFTOVERS…</strong>
+          <span>{shortAddress(account)} · choose a detected bag above as soon as it appears.</span>
+        </div>
+        <div className="direct-quote"><span>YOU RECEIVE</span><strong>$CUCK</strong><small>Pick a bag to get a live quote.</small></div>
+        {error ? <div className="factory-finish-error">{error}</div> : null}
+        <button type="button" className="direct-other" onClick={onUseSolana}>SOLANA / MANUAL TOKEN →</button>
+      </section>
+    );
+  }
 
   return (
     <section className="direct-swap">
       <div className="swap-heading">
-        <strong>RECYCLE ROBINHOOD ETH</strong>
-        <span>One quote. One confirmation. You receive $CUCK.</span>
+        <strong>RECYCLE {token.symbol}</strong>
+        <span>{token.chainLabel} → $CUCK on Robinhood. One quote, one wallet transaction.</span>
       </div>
+
+      <div className="direct-wallet">✓ {shortAddress(account)} · {token.chainLabel}</div>
+
       <div className="direct-grid">
-        <div className="direct-token-card"><span>FROM</span><strong>ETH</strong><small>Robinhood Chain</small></div>
-        <div className="direct-token-card output"><span>TO</span><strong>$CUCK</strong><small>Locked</small></div>
+        <div className="direct-token-card"><span>FROM</span><strong>{token.symbol}</strong><small>{token.chainLabel}</small></div>
+        <div className="direct-token-card output"><span>TO</span><strong>$CUCK</strong><small>Robinhood Chain · locked</small></div>
       </div>
-      <label className="direct-amount"><span>AMOUNT</span><div><input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" /><b>ETH</b></div></label>
-      {humanBalance > 0 ? <div className="direct-percent-row"><button type="button" onClick={() => setPct(.25)}>25%</button><button type="button" onClick={() => setPct(.5)}>50%</button><button type="button" onClick={() => setPct(.75)}>75%</button><button type="button" onClick={() => setPct(1)}>MAX</button></div> : null}
-      <div className="direct-quote"><span>YOU RECEIVE</span><strong>{state === 'quoting' ? 'CHECKING…' : quoteBody ? `≈ ${expected} $CUCK` : '— $CUCK'}</strong>{quoteBody ? <small>Route found via {quoteBody.toolDetails?.name || quoteBody.tool}</small> : null}</div>
+
+      <label className="direct-amount">
+        <span>AMOUNT</span>
+        <div><input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" /><b>{token.symbol}</b></div>
+      </label>
+
+      <div className="direct-percent-row">
+        <button type="button" onClick={() => setAmount(String(Number((token.balance * 0.25).toPrecision(10))))}>25%</button>
+        <button type="button" onClick={() => setAmount(String(Number((token.balance * 0.50).toPrecision(10))))}>50%</button>
+        <button type="button" onClick={() => setAmount(String(Number((token.balance * 0.75).toPrecision(10))))}>75%</button>
+        <button type="button" onClick={() => setAmount(defaultRecycleAmount(token))}>MAX</button>
+      </div>
+
+      <div className="direct-quote">
+        <span>YOU RECEIVE</span>
+        <strong>{state === 'quoting' ? 'CHECKING…' : quoteBody ? `≈ ${expected} $CUCK` : '— $CUCK'}</strong>
+        {quoteBody ? <small>Route found via {routeName} ✓</small> : null}
+      </div>
+
       {error ? <div className="factory-finish-error">{error}</div> : null}
-      {!isEvmAddress(account) ? (
-        <button type="button" className="direct-recycle" onClick={connect}>CONNECT WALLET</button>
-      ) : (
-        <button type="button" className="direct-recycle" onClick={execute} disabled={!quoteBody || state === 'quoting' || state === 'executing' || state === 'done'}>{state === 'executing' ? 'CONFIRM IN WALLET…' : state === 'done' ? 'BAG RECYCLED ✓' : 'SWAP → $CUCK'}</button>
-      )}
-      <button type="button" className="direct-other" onClick={onUseOtherChain}>TOKEN ON ANOTHER CHAIN? →</button>
+
+      <button
+        type="button"
+        className="direct-recycle"
+        onClick={execute}
+        disabled={!quoteBody || state === 'quoting' || state === 'executing' || state === 'done'}
+      >
+        {state === 'executing' ? 'CONFIRMING…' : state === 'done' ? 'SUBMITTED ✓' : 'SWAP → $CUCK'}
+      </button>
+
+      <button type="button" className="direct-other" onClick={onUseSolana}>SOLANA / TOKEN NOT FOUND →</button>
+      <small className="direct-note">LI.FI routes in the background. No embedded LI.FI wallet selector is used for EVM bags.</small>
     </section>
   );
 }
@@ -1059,9 +1238,6 @@ function SwapWidget({ destination, sourceToken, sourceForm, onQuote, onCompleted
           decimals: 18,
           coinKey: 'CUCK',
         }],
-        to: {
-          allow: [{ chainId: CUCK.chainId, address: CUCK.address }],
-        },
       },
 
       disabledUI: {
@@ -1073,12 +1249,12 @@ function SwapWidget({ destination, sourceToken, sourceForm, onQuote, onCompleted
         appearance: true,
         language: true,
         reverseTokensButton: true,
-        poweredBy: false,
+        poweredBy: true,
       },
 
       // New keyPrefix prevents old per-user widget exchange settings from
       // carrying over from earlier test builds.
-      keyPrefix: 'cuck-bag-recycler-v17',
+      keyPrefix: 'cuck-bag-recycler-v20',
 
       showSingleRoute: true,
       routePriority: 'RECOMMENDED',
@@ -1611,7 +1787,7 @@ function App() {
   const connectForScan = async () => {
     setWalletConnectError('');
     try {
-      const provider = window.ethereum;
+      const provider = getPreferredEvmProvider();
       if (!provider?.request) throw new Error('No EVM wallet detected. Use another wallet below instead.');
       await ensureRobinhoodWallet(provider);
       const accounts = await provider.request({ method: 'eth_requestAccounts' });
@@ -1665,7 +1841,7 @@ function App() {
     setRouteState('idle');
     setGatewayResult(null);
     setResult(null);
-    setCrossChainMode(Number(holding.chainId) !== CUCK.chainId);
+    setCrossChainMode(Number(holding.chainId) === Number(ALCHEMY_NETWORKS['sol-mainnet'].chainId));
     setSourceForm({
       chainId: holding.chainId,
       tokenAddress: holding.tokenAddress,
@@ -1833,28 +2009,51 @@ function App() {
           />
 
           <div id="swap-widget">
-            {!crossChainMode && (!selectedHolding || Number(selectedHolding.chainId) === CUCK.chainId) ? (
-              <RobinhoodCuckSwap
+            {!crossChainMode ? (
+              <DirectEvmCuckSwap
                 destination={destination}
                 wallet={wallets.evmAddress}
+                sourceToken={selectedHolding && Number(selectedHolding.chainId) !== Number(ALCHEMY_NETWORKS['sol-mainnet'].chainId) ? selectedHolding : null}
                 onWalletConnected={handleWalletConnected}
                 onQuote={setQuote}
                 onFinished={handleFactoryFinished}
-                onUseOtherChain={() => setCrossChainMode(true)}
+                onUseSolana={() => {
+                  setCrossChainMode(true);
+                  setSelectedHolding(null);
+                  setSourceForm({ chainId: null, tokenAddress: '', fromAmount: '' });
+                  setQuote(null);
+                  setResult(null);
+                }}
               />
             ) : (
-              <SwapWidget
-                destination={destination}
-                sourceToken={selectedHolding}
-                sourceForm={sourceForm}
-                onQuote={handleQuote}
-                onStarted={handleStarted}
-                onCompleted={handleCompleted}
-                onWalletConnected={handleWalletConnected}
-                onRoutes={handleRoutes}
-                onFormChanged={handleFormChanged}
-                onSourceSelected={handleSourceSelected}
-              />
+              <>
+                <button
+                  type="button"
+                  className="direct-other crosschain-back"
+                  onClick={() => {
+                    setCrossChainMode(false);
+                    setSelectedHolding(null);
+                    setSourceForm({ chainId: null, tokenAddress: '', fromAmount: '' });
+                    setQuote(null);
+                    setResult(null);
+                  }}
+                >
+                  ← BACK TO EVM BAGS
+                </button>
+
+                <SwapWidget
+                  destination={destination}
+                  sourceToken={selectedHolding}
+                  sourceForm={sourceForm}
+                  onQuote={handleQuote}
+                  onStarted={handleStarted}
+                  onCompleted={handleCompleted}
+                  onWalletConnected={handleWalletConnected}
+                  onRoutes={handleRoutes}
+                  onFormChanged={handleFormChanged}
+                  onSourceSelected={handleSourceSelected}
+                />
+              </>
             )}
           </div>
         </section>
