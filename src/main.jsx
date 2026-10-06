@@ -1025,30 +1025,85 @@ async function ensureEvmChain(provider, chainId) {
 
 function readRpcForChain(chainId) {
   if (Number(chainId) === CUCK.chainId) {
-    return ROUTING.robinhoodReadRpc || ROUTING.robinhoodRpc;
+    return ROUTING.robinhoodReadRpc || ROUTING.robinhoodWalletRpc || ROUTING.robinhoodRpc;
   }
   return EVM_CHAIN_META[Number(chainId)]?.rpcUrls?.[0] || '';
 }
 
-async function waitForChainReceipt(chainId, txHash, attempts = 120) {
-  const rpcUrl = readRpcForChain(chainId);
-  if (!rpcUrl) throw new Error('No read RPC configured for this chain.');
+function readRpcCandidates(chainId) {
+  const urls = [];
+  const push = (value) => {
+    if (value && !urls.includes(value)) urls.push(value);
+  };
+
+  if (Number(chainId) === CUCK.chainId) {
+    push(ROUTING.robinhoodReadRpc);
+    push(ROUTING.robinhoodWalletRpc);
+    push(ROUTING.robinhoodFallbackRpc);
+    push(ROUTING.robinhoodRpc);
+  } else {
+    push(readRpcForChain(chainId));
+  }
+
+  return urls;
+}
+
+async function blockscoutReceipt(chainId, txHash) {
+  if (Number(chainId) !== CUCK.chainId) return null;
+
+  try {
+    const response = await fetch(`https://robinhoodchain.blockscout.com/api/v2/transactions/${txHash}`, {
+      headers: { accept: 'application/json' },
+      cache: 'no-store',
+    });
+    if (!response.ok) return null;
+    const tx = await response.json();
+
+    const status = String(tx?.status || '').toLowerCase();
+    if (status === 'error' || status === 'failed') {
+      throw new Error('Transaction reverted.');
+    }
+
+    if (tx?.block_number || tx?.block || status === 'ok' || status === 'success') {
+      return { status: '0x1', blockNumber: tx?.block_number || tx?.block || null, explorer: true };
+    }
+  } catch (error) {
+    if (String(error?.message || '').toLowerCase().includes('revert')) throw error;
+  }
+
+  return null;
+}
+
+async function waitForChainReceipt(chainId, txHash, attempts = 90) {
+  const rpcUrls = readRpcCandidates(chainId);
+  if (!rpcUrls.length && Number(chainId) !== CUCK.chainId) {
+    throw new Error('No read RPC configured for this chain.');
+  }
 
   for (let i = 0; i < attempts; i += 1) {
-    try {
-      const receipt = await rpcCallUrl(rpcUrl, 'eth_getTransactionReceipt', [txHash]);
-      if (receipt) {
-        if (receipt.status && receipt.status !== '0x1') throw new Error('Transaction reverted.');
-        return receipt;
+    for (const rpcUrl of rpcUrls) {
+      try {
+        const receipt = await rpcCallUrl(rpcUrl, 'eth_getTransactionReceipt', [txHash]);
+        if (receipt) {
+          if (receipt.status && receipt.status !== '0x1') throw new Error('Transaction reverted.');
+          return receipt;
+        }
+      } catch (error) {
+        if (String(error?.message || '').toLowerCase().includes('revert')) throw error;
       }
-    } catch (error) {
-      // A temporary public RPC error should not send the user back into the wallet app.
-      if (String(error?.message || '').includes('reverted')) throw error;
     }
+
+    try {
+      const explorerReceipt = await blockscoutReceipt(chainId, txHash);
+      if (explorerReceipt) return explorerReceipt;
+    } catch (error) {
+      if (String(error?.message || '').toLowerCase().includes('revert')) throw error;
+    }
+
     await new Promise((resolve) => window.setTimeout(resolve, 2000));
   }
 
-  throw new Error('Transaction was submitted, but confirmation is taking longer than expected. Check the transaction in your wallet.');
+  return null;
 }
 
 async function waitForProviderReceipt(provider, txHash, attempts = 100) {
@@ -1093,6 +1148,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
   const [quoteBody, setQuoteBody] = useState(null);
   const [state, setState] = useState('idle');
   const [error, setError] = useState('');
+  const [submittedTxHash, setSubmittedTxHash] = useState('');
 
   useEffect(() => {
     let live = true;
@@ -1125,6 +1181,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
   useEffect(() => {
     if (sourceToken) setAmount(defaultRecycleAmount(sourceToken));
     setQuoteBody(null);
+    setSubmittedTxHash('');
     setState('idle');
     setError('');
   }, [sourceToken?.id]);
@@ -1213,6 +1270,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
     setFallbackBalance(0);
     setAmount('');
     setQuoteBody(null);
+    setSubmittedTxHash('');
     setState('idle');
     setError('');
     onWalletDisconnected?.();
@@ -1330,7 +1388,26 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
       if (req.maxPriorityFeePerGas) tx.maxPriorityFeePerGas = req.maxPriorityFeePerGas;
 
       const txHash = await provider.request({ method: 'eth_sendTransaction', params: [tx] });
-      await waitForChainReceipt(chainId, txHash);
+      setSubmittedTxHash(txHash);
+      setState('submitted');
+
+      try {
+        sessionStorage.setItem('cuck_pending_tx', JSON.stringify({
+          txHash,
+          chainId,
+          createdAt: Date.now(),
+        }));
+      } catch {}
+
+      const receipt = await waitForChainReceipt(chainId, txHash);
+
+      if (!receipt) {
+        setState('submitted');
+        setError('Transaction submitted. Automatic confirmation is taking longer than expected — do not submit it again. Check the transaction status below.');
+        return;
+      }
+
+      try { sessionStorage.removeItem('cuck_pending_tx'); } catch {}
 
       const toDecimals = quoteBody?.action?.toToken?.decimals ?? 18;
       const toAmount = quoteBody?.estimate?.toAmount || '0';
@@ -1497,7 +1574,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
                 onClick={() => onSelectHolding?.(item)}
               >
                 <b>{item.symbol}</b>
-                <small>{item.usd > 0 ? money(item.usd) : item.chainLabel}</small>
+                <small>{item.balance.toLocaleString('en-US', { maximumFractionDigits: 8 })} {item.symbol} · {item.chainLabel}{item.usd > 0 ? ` · ${money(item.usd)}` : ''}</small>
               </button>
             ))}
           </div>
@@ -1536,15 +1613,29 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
         {quoteBody ? <small>Route found via {routeName} ✓</small> : null}
       </div>
 
+      {submittedTxHash ? (
+        <div className="submitted-tx">
+          <span>TRANSACTION SENT</span>
+          <b>{shortAddress(submittedTxHash)}</b>
+          <a
+            href={`https://robinhoodchain.blockscout.com/tx/${submittedTxHash}`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            CHECK STATUS ↗
+          </a>
+        </div>
+      ) : null}
+
       {error ? <div className="factory-finish-error">{error}</div> : null}
 
       <button
         type="button"
         className="direct-recycle"
         onClick={execute}
-        disabled={!quoteBody || state === 'quoting' || state === 'executing' || state === 'done'}
+        disabled={!quoteBody || state === 'quoting' || state === 'executing' || state === 'submitted' || state === 'done'}
       >
-        {state === 'executing' ? 'WAITING FOR CHAIN CONFIRMATION…' : state === 'done' ? 'CONFIRMED ✓' : 'SWAP → $CUCK'}
+        {state === 'executing' ? 'OPENING WALLET…' : state === 'submitted' ? 'TRANSACTION SUBMITTED ✓' : state === 'done' ? 'CONFIRMED ✓' : 'SWAP → $CUCK'}
       </button>
       <small className="direct-note">Routing happens in the background. You only choose the bag and receive $CUCK.</small>
     </section>
