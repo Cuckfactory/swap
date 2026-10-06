@@ -2453,25 +2453,33 @@ function App() {
           <div className="machine-head">
             <div>
               <span>ONE SWAP</span>
-              <strong>ANY SUPPORTED EVM BAG → $CUCK</strong>
+              <strong>ANY TOKEN → $CUCK</strong>
             </div>
             <b>+$CUCKDROP VALUE</b>
           </div>
 
 
           <div id="swap-widget">
-            <DirectEvmCuckSwap
+            <WalletHoldings
+              holdings={holdings}
+              loading={holdingsLoading}
+              error={holdingsError}
+              connected={isEvmAddress(wallets.evmAddress) || looksLikeSolanaAddress(wallets.solanaAddress)}
+              onRecycle={handleHoldingSelected}
+              selected={selectedHolding}
+            />
+
+            <SwapWidget
               destination={destination}
-              wallet={wallets.evmAddress}
-              sourceToken={selectedHolding && Number(selectedHolding.chainId) !== Number(ALCHEMY_NETWORKS['sol-mainnet'].chainId) ? selectedHolding : null}
-              holdings={holdings.filter((item) => Number(item.chainId) !== Number(ALCHEMY_NETWORKS['sol-mainnet'].chainId))}
-              holdingsLoading={holdingsLoading}
-              holdingsError={holdingsError}
-              onSelectHolding={handleHoldingSelected}
+              sourceToken={selectedHolding}
+              sourceForm={sourceForm}
+              onQuote={handleQuote}
+              onCompleted={handleCompleted}
+              onStarted={handleStarted}
               onWalletConnected={handleWalletConnected}
-              onWalletDisconnected={handleWalletDisconnected}
-              onQuote={setQuote}
-              onFinished={handleFactoryFinished}
+              onRoutes={handleRoutes}
+              onFormChanged={handleFormChanged}
+              onSourceSelected={handleSourceSelected}
             />
           </div>
         </section>
