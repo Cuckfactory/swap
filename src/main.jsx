@@ -948,11 +948,12 @@ async function providerApprove(provider, from, token, spender, amount) {
 }
 
 
-function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected, onQuote, onFinished, onUseSolana }) {
+function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected, onQuote, onFinished }) {
   const walletProviderRef = React.useRef(null);
   const [walletChoices, setWalletChoices] = useState([]);
   const [walletLabel, setWalletLabel] = useState('');
   const [account, setAccount] = useState(isEvmAddress(wallet) ? wallet : '');
+  const [fallbackBalance, setFallbackBalance] = useState(0);
   const [amount, setAmount] = useState(sourceToken ? defaultRecycleAmount(sourceToken) : '');
   const [quoteBody, setQuoteBody] = useState(null);
   const [state, setState] = useState('idle');
@@ -964,10 +965,22 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
     return () => { live = false; };
   }, []);
 
-  const token = sourceToken || null;
-  const chainId = Number(token?.chainId || 0);
-  const tokenAddress = token?.tokenAddress || '';
-  const tokenDecimals = token?.decimals ?? 18;
+  const fallbackToken = {
+    id: '4663:0x0000000000000000000000000000000000000000',
+    chainId: CUCK.chainId,
+    chainLabel: 'Robinhood Chain',
+    tokenAddress: ROUTING.robinhoodNativeToken,
+    symbol: 'ETH',
+    name: 'Ethereum',
+    balance: fallbackBalance,
+    rawBalance: '',
+    decimals: 18,
+    usd: 0,
+  };
+  const token = sourceToken || fallbackToken;
+  const chainId = Number(token.chainId);
+  const tokenAddress = token.tokenAddress;
+  const tokenDecimals = token.decimals ?? 18;
   const isNative = sameAddress(tokenAddress, '0x0000000000000000000000000000000000000000');
 
   useEffect(() => {
@@ -975,11 +988,11 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
   }, [wallet]);
 
   useEffect(() => {
-    setAmount(token ? defaultRecycleAmount(token) : '');
+    if (sourceToken) setAmount(defaultRecycleAmount(sourceToken));
     setQuoteBody(null);
     setState('idle');
     setError('');
-  }, [token?.id]);
+  }, [sourceToken?.id]);
 
   const connectChoice = async (choice) => {
     setError('');
@@ -993,6 +1006,19 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
       if (!isEvmAddress(address)) throw new Error('No account returned.');
       setAccount(address);
       onWalletConnected?.({ address });
+
+      if (!sourceToken) {
+        try {
+          await ensureEvmChain(provider, CUCK.chainId);
+          const balanceHex = await provider.request({ method: 'eth_getBalance', params: [address, 'latest'] });
+          const balance = Number(formatUnits(BigInt(balanceHex || '0x0').toString(), 18, 10));
+          setFallbackBalance(balance);
+          if (balance > 0) setAmount(String(Number((balance * 0.95).toPrecision(10))));
+        } catch {
+          // The user can still type an amount manually.
+        }
+      }
+
       return address;
     } catch (err) {
       setError(err?.message || 'Wallet connection failed.');
@@ -1150,36 +1176,30 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
   const routeName = quoteBody?.toolDetails?.name || quoteBody?.tool || 'LI.FI';
 
   if (!isEvmAddress(account)) {
+    const preferred = walletChoices.find((choice) => choice.label === 'MetaMask')
+      || walletChoices.find((choice) => !/phantom/i.test(choice.label))
+      || null;
+
     return (
       <section className="direct-swap">
         <div className="swap-heading">
-          <strong>CHOOSE THE WALLET THAT HOLDS THE BAG</strong>
-          <span>MetaMask and Phantom are separate. The page will not pick for you.</span>
+          <strong>CONNECT WALLET</strong>
+          <span>We find your EVM leftovers. $CUCK is always the output.</span>
         </div>
-        <div className="direct-percent-row">
-          {walletChoices.length ? walletChoices.map((choice) => (
-            <button key={choice.label} type="button" onClick={() => connectChoice(choice)}>{choice.label}</button>
-          )) : <span>No wallet found. Install MetaMask, then refresh.</span>}
-        </div>
+
+        {preferred ? (
+          <button type="button" className="direct-recycle" onClick={() => connectChoice(preferred)}>
+            CONNECT {preferred.label.toUpperCase()}
+          </button>
+        ) : (
+          <div className="factory-finish-error">No EVM wallet found. Install MetaMask and refresh.</div>
+        )}
+
         {error ? <div className="factory-finish-error">{error}</div> : null}
-        <button type="button" className="direct-other" onClick={onUseSolana}>SOLANA / MANUAL TOKEN →</button>
       </section>
     );
   }
 
-  if (!token) {
-    return (
-      <section className="direct-swap">
-        <div className="swap-heading">
-          <strong>FINDING YOUR LEFTOVERS…</strong>
-          <span>{shortAddress(account)} · choose a detected bag above as soon as it appears.</span>
-        </div>
-        <div className="direct-quote"><span>YOU RECEIVE</span><strong>$CUCK</strong><small>Pick a bag to get a live quote.</small></div>
-        {error ? <div className="factory-finish-error">{error}</div> : null}
-        <button type="button" className="direct-other" onClick={onUseSolana}>SOLANA / MANUAL TOKEN →</button>
-      </section>
-    );
-  }
 
   return (
     <section className="direct-swap">
@@ -1223,9 +1243,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
       >
         {state === 'executing' ? 'CONFIRMING…' : state === 'done' ? 'SUBMITTED ✓' : 'SWAP → $CUCK'}
       </button>
-
-      <button type="button" className="direct-other" onClick={onUseSolana}>SOLANA / TOKEN NOT FOUND →</button>
-      <small className="direct-note">LI.FI routes in the background. No embedded LI.FI wallet selector is used for EVM bags.</small>
+      <small className="direct-note">Routing happens in the background. You only choose the bag and receive $CUCK.</small>
     </section>
   );
 }
@@ -1875,7 +1893,7 @@ function App() {
     setRouteState('idle');
     setGatewayResult(null);
     setResult(null);
-    setCrossChainMode(Number(holding.chainId) === Number(ALCHEMY_NETWORKS['sol-mainnet'].chainId));
+    setCrossChainMode(false);
     setSourceForm({
       chainId: holding.chainId,
       tokenAddress: holding.tokenAddress,
@@ -2028,7 +2046,7 @@ function App() {
           <div className="machine-head">
             <div>
               <span>ONE SWAP</span>
-              <strong>ANY SUPPORTED BAG → $CUCK</strong>
+              <strong>ANY SUPPORTED EVM BAG → $CUCK</strong>
             </div>
             <b>+$CUCKDROP VALUE</b>
           </div>
@@ -2043,52 +2061,14 @@ function App() {
           />
 
           <div id="swap-widget">
-            {!crossChainMode ? (
-              <DirectEvmCuckSwap
-                destination={destination}
-                wallet={wallets.evmAddress}
-                sourceToken={selectedHolding && Number(selectedHolding.chainId) !== Number(ALCHEMY_NETWORKS['sol-mainnet'].chainId) ? selectedHolding : null}
-                onWalletConnected={handleWalletConnected}
-                onQuote={setQuote}
-                onFinished={handleFactoryFinished}
-                onUseSolana={() => {
-                  setCrossChainMode(true);
-                  setSelectedHolding(null);
-                  setSourceForm({ chainId: null, tokenAddress: '', fromAmount: '' });
-                  setQuote(null);
-                  setResult(null);
-                }}
-              />
-            ) : (
-              <>
-                <button
-                  type="button"
-                  className="direct-other crosschain-back"
-                  onClick={() => {
-                    setCrossChainMode(false);
-                    setSelectedHolding(null);
-                    setSourceForm({ chainId: null, tokenAddress: '', fromAmount: '' });
-                    setQuote(null);
-                    setResult(null);
-                  }}
-                >
-                  ← BACK TO EVM BAGS
-                </button>
-
-                <SwapWidget
-                  destination={destination}
-                  sourceToken={selectedHolding}
-                  sourceForm={sourceForm}
-                  onQuote={handleQuote}
-                  onStarted={handleStarted}
-                  onCompleted={handleCompleted}
-                  onWalletConnected={handleWalletConnected}
-                  onRoutes={handleRoutes}
-                  onFormChanged={handleFormChanged}
-                  onSourceSelected={handleSourceSelected}
-                />
-              </>
-            )}
+            <DirectEvmCuckSwap
+              destination={destination}
+              wallet={wallets.evmAddress}
+              sourceToken={selectedHolding && Number(selectedHolding.chainId) !== Number(ALCHEMY_NETWORKS['sol-mainnet'].chainId) ? selectedHolding : null}
+              onWalletConnected={handleWalletConnected}
+              onQuote={setQuote}
+              onFinished={handleFactoryFinished}
+            />
           </div>
         </section>
 
