@@ -308,3 +308,27 @@ main{width:min(900px,calc(100% - 32px));padding-top:34px}
   .deal-split .plus{min-height:22px}
   .deal-split>div:not(.plus){min-height:auto!important}
 }
+
+
+/* V22 wallet chooser + bag picker */
+.wallet-choice-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.wallet-choice-button{min-height:66px;border:1px solid #6e4b20;background:#120805;color:var(--cream);padding:12px 14px;text-align:left;cursor:pointer;display:flex;flex-direction:column;justify-content:center;gap:3px}
+.wallet-choice-button b{font:700 18px Oswald,sans-serif}.wallet-choice-button small{color:#9d8666;font-size:10px}
+.wallet-choice-button:disabled{opacity:.55}
+.bag-picker{margin:12px 0;padding:12px;border:1px solid #4f351b;background:#0a0503;display:flex;flex-direction:column;gap:9px}
+.bag-picker>span{color:#9b805d;font:700 8px 'IBM Plex Mono',monospace;letter-spacing:1px}
+.bag-picker>small{color:#9d8666;font-size:10px;line-height:1.4}
+.bag-picker-list{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}
+.bag-picker-list button{min-height:55px;border:1px solid #55391c;background:#150a06;color:var(--cream);padding:8px;cursor:pointer;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:2px}
+.bag-picker-list button.active{border-color:var(--gold2);background:#261408}
+.bag-picker-list b{font:700 15px Oswald,sans-serif}.bag-picker-list small{color:#9d8666;font-size:8px}
+.available-balance{display:block;margin-top:7px;color:#a98f6c;font:700 9px 'IBM Plex Mono',monospace;line-height:1.35}
+@media(max-width:680px){
+  .wallet-choice-grid{grid-template-columns:1fr}
+  .wallet-choice-button{min-height:58px}
+  .bag-picker-list{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .direct-grid{grid-template-columns:1fr 1fr}
+  .direct-token-card{min-width:0;padding:12px}
+  .direct-token-card strong{font-size:25px}
+  .direct-amount input{font-size:29px}
+}
