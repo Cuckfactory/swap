@@ -332,3 +332,15 @@ main{width:min(900px,calc(100% - 32px));padding-top:34px}
   .direct-token-card strong{font-size:25px}
   .direct-amount input{font-size:29px}
 }
+
+
+/* V23 verified balances + wallet switching */
+.direct-wallet{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.change-wallet-button{border:0;background:transparent;color:var(--gold2);font:700 8px 'IBM Plex Mono',monospace;letter-spacing:.7px;cursor:pointer;padding:4px 0;white-space:nowrap}
+.change-wallet-button:hover{text-decoration:underline}
+.scan-status{border:1px solid #5a3c1d;background:#0a0503;color:#b49b79;padding:14px;font-size:12px;line-height:1.45}
+@media(max-width:680px){
+  .direct-wallet{align-items:flex-start}
+  .change-wallet-button{font-size:9px;padding-top:2px}
+  .scan-status{font-size:11px}
+}
