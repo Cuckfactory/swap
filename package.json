@@ -18,7 +18,8 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "wagmi": "latest",
-    "viem": "latest"
+    "viem": "latest",
+    "@metamask/connect-evm": "latest"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "latest",
