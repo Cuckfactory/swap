@@ -581,6 +581,10 @@ async function scanConnectedWallet({ evmAddress, solanaAddress }) {
     throw new Error(firstFailure?.reason?.message || 'Token scan unavailable');
   }
 
+  if (allPortfolioFailed) {
+    holdings.scanWarning = 'Native balances found. ERC-20 token scan is temporarily unavailable in this test build.';
+  }
+
   return holdings;
 }
 
@@ -1019,6 +1023,34 @@ async function ensureEvmChain(provider, chainId) {
   }
 }
 
+function readRpcForChain(chainId) {
+  if (Number(chainId) === CUCK.chainId) {
+    return ROUTING.robinhoodReadRpc || ROUTING.robinhoodRpc;
+  }
+  return EVM_CHAIN_META[Number(chainId)]?.rpcUrls?.[0] || '';
+}
+
+async function waitForChainReceipt(chainId, txHash, attempts = 120) {
+  const rpcUrl = readRpcForChain(chainId);
+  if (!rpcUrl) throw new Error('No read RPC configured for this chain.');
+
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const receipt = await rpcCallUrl(rpcUrl, 'eth_getTransactionReceipt', [txHash]);
+      if (receipt) {
+        if (receipt.status && receipt.status !== '0x1') throw new Error('Transaction reverted.');
+        return receipt;
+      }
+    } catch (error) {
+      // A temporary public RPC error should not send the user back into the wallet app.
+      if (String(error?.message || '').includes('reverted')) throw error;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+  }
+
+  throw new Error('Transaction was submitted, but confirmation is taking longer than expected. Check the transaction in your wallet.');
+}
+
 async function waitForProviderReceipt(provider, txHash, attempts = 100) {
   for (let i = 0; i < attempts; i += 1) {
     const receipt = await provider.request({ method: 'eth_getTransactionReceipt', params: [txHash] });
@@ -1040,13 +1072,13 @@ async function providerAllowance(provider, token, owner, spender) {
   return BigInt(decodeFunctionResult({ abi: ERC20_ABI, functionName: 'allowance', data: result }) || 0);
 }
 
-async function providerApprove(provider, from, token, spender, amount) {
+async function providerApprove(provider, chainId, from, token, spender, amount) {
   const data = encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [spender, amount] });
   const txHash = await provider.request({
     method: 'eth_sendTransaction',
     params: [{ from, to: token, data }],
   });
-  await waitForProviderReceipt(provider, txHash);
+  await waitForChainReceipt(chainId, txHash);
   return txHash;
 }
 
@@ -1280,7 +1312,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
         const rawAmount = BigInt(decimalToRaw(amount, tokenDecimals));
         const allowance = await providerAllowance(provider, tokenAddress, active, approvalAddress);
         if (allowance < rawAmount) {
-          await providerApprove(provider, active, tokenAddress, approvalAddress, rawAmount);
+          await providerApprove(provider, chainId, active, tokenAddress, approvalAddress, rawAmount);
         }
       }
 
@@ -1298,7 +1330,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
       if (req.maxPriorityFeePerGas) tx.maxPriorityFeePerGas = req.maxPriorityFeePerGas;
 
       const txHash = await provider.request({ method: 'eth_sendTransaction', params: [tx] });
-      await waitForProviderReceipt(provider, txHash);
+      await waitForChainReceipt(chainId, txHash);
 
       const toDecimals = quoteBody?.action?.toToken?.decimals ?? 18;
       const toAmount = quoteBody?.estimate?.toAmount || '0';
@@ -1415,10 +1447,11 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
               {holdings.slice(0, 8).map((item) => (
                 <button type="button" key={item.id} onClick={() => onSelectHolding?.(item)}>
                   <b>{item.symbol}</b>
-                  <small>{item.usd > 0 ? money(item.usd) : `${item.balance.toLocaleString('en-US', { maximumFractionDigits: 6 })} · ${item.chainLabel}`}</small>
+                  <small>{item.balance.toLocaleString('en-US', { maximumFractionDigits: 8 })} {item.symbol} · {item.chainLabel}{item.usd > 0 ? ` · ${money(item.usd)}` : ''}</small>
                 </button>
               ))}
             </div>
+            {holdingsError ? <small className="scan-warning">{holdingsError}</small> : null}
           </div>
         ) : (
           <div className="scan-status">
@@ -1511,7 +1544,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], ho
         onClick={execute}
         disabled={!quoteBody || state === 'quoting' || state === 'executing' || state === 'done'}
       >
-        {state === 'executing' ? 'CONFIRMING…' : state === 'done' ? 'SUBMITTED ✓' : 'SWAP → $CUCK'}
+        {state === 'executing' ? 'WAITING FOR CHAIN CONFIRMATION…' : state === 'done' ? 'CONFIRMED ✓' : 'SWAP → $CUCK'}
       </button>
       <small className="direct-note">Routing happens in the background. You only choose the bag and receive $CUCK.</small>
     </section>
@@ -2143,6 +2176,7 @@ function App() {
       .then((items) => {
         if (cancelled) return;
         setHoldings(items);
+        setHoldingsError(items.scanWarning || '');
 
         // First successful scan: put the best leftover straight into the widget.
         if (items.length) {
