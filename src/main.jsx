@@ -889,13 +889,19 @@ async function getMetaMaskConnectClient() {
 
 async function connectMetaMaskUniversal() {
   const client = await getMetaMaskConnectClient();
-  const result = await client.connect({ chainIds: ['0x1237'] });
+  const result = await client.connect({ chainIds: ['0x1'] });
   const provider = client.getProvider();
   const address = result?.accounts?.[0] || '';
   if (!provider?.request || !isEvmAddress(address)) {
     throw new Error('MetaMask connection did not return an EVM account.');
   }
   return { provider, address, label: 'MetaMask' };
+}
+
+function openCurrentDappInPhantom() {
+  const url = encodeURIComponent(window.location.href);
+  const ref = encodeURIComponent(window.location.origin);
+  window.location.href = `https://phantom.app/ul/browse/${url}?ref=${ref}`;
 }
 
 function discoverEvmWallets() {
@@ -994,7 +1000,7 @@ async function providerApprove(provider, from, token, spender, amount) {
 }
 
 
-function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected, onQuote, onFinished }) {
+function DirectEvmCuckSwap({ destination, wallet, sourceToken, holdings = [], holdingsLoading = false, holdingsError = '', onSelectHolding, onWalletConnected, onQuote, onFinished }) {
   const walletProviderRef = React.useRef(null);
   const [walletChoices, setWalletChoices] = useState([]);
   const [walletLabel, setWalletLabel] = useState('');
@@ -1055,8 +1061,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
 
       if (!sourceToken) {
         try {
-          await ensureEvmChain(provider, CUCK.chainId);
-          const balanceHex = await provider.request({ method: 'eth_getBalance', params: [address, 'latest'] });
+          const balanceHex = await rpcCall('eth_getBalance', [address, 'latest']);
           const balance = Number(formatUnits(BigInt(balanceHex || '0x0').toString(), 18, 10));
           setFallbackBalance(balance);
           if (balance > 0) setAmount(String(Number((balance * 0.95).toPrecision(10))));
@@ -1072,24 +1077,20 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
     }
   };
 
-  const connectUniversal = async () => {
+  const connectMetaMask = async () => {
     setError('');
     setState('connecting');
 
     try {
-      // Desktop: prefer an injected MetaMask provider when present.
       const discovered = walletChoices.length ? walletChoices : await discoverEvmWallets();
-      const injected = discovered.find((choice) => choice.label === 'MetaMask')
-        || discovered.find((choice) => !/phantom/i.test(choice.label));
+      const injectedMetaMask = discovered.find((choice) => choice.label === 'MetaMask');
 
-      if (injected?.provider?.request) {
-        const address = await connectChoice(injected);
+      if (injectedMetaMask?.provider?.request) {
+        const address = await connectChoice(injectedMetaMask);
         if (address) setState('idle');
         return address;
       }
 
-      // Mobile Safari/Chrome: MetaMask Connect deeplinks into the mobile app,
-      // then returns a persistent EIP-1193 provider/session to this page.
       const connected = await connectMetaMaskUniversal();
       walletProviderRef.current = connected.provider;
       setWalletLabel(connected.label);
@@ -1097,19 +1098,13 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
       onWalletConnected?.({ address: connected.address });
 
       try {
-        await ensureEvmChain(connected.provider, CUCK.chainId);
-        const balanceHex = await connected.provider.request({
-          method: 'eth_getBalance',
-          params: [connected.address, 'latest'],
-        });
+        const balanceHex = await rpcCall('eth_getBalance', [connected.address, 'latest']);
         const balance = Number(formatUnits(BigInt(balanceHex || '0x0').toString(), 18, 10));
         setFallbackBalance(balance);
         if (!sourceToken && balance > 0) {
           setAmount(String(Number((balance * 0.95).toPrecision(10))));
         }
-      } catch {
-        // Connection succeeded; chain/balance can still be selected later.
-      }
+      } catch {}
 
       setState('idle');
       return connected.address;
@@ -1119,6 +1114,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
       return '';
     }
   };
+
 
   useEffect(() => {
     const numeric = Number(amount || 0);
@@ -1147,7 +1143,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
           fromAddress: account,
           toAddress: recipient,
           slippage: '0.03',
-          integrator: 'cuck-factory-bag-recycler',
+          integrator: 'cuckfactory',
         });
 
         const response = await fetch(`https://li.quest/v1/quote?${params.toString()}`);
@@ -1189,7 +1185,7 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
     if (!quoteBody?.transactionRequest || !token) return;
 
     let signer = account;
-    if (!isEvmAddress(signer)) signer = await connectUniversal();
+    if (!isEvmAddress(signer)) signer = await connectMetaMask();
     if (!isEvmAddress(signer)) return;
 
     setState('executing');
@@ -1270,24 +1266,58 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
   const routeName = quoteBody?.toolDetails?.name || quoteBody?.tool || 'LI.FI';
 
   if (!isEvmAddress(account)) {
+    const injectedChoices = walletChoices.filter((choice, index, list) =>
+      list.findIndex((item) => item.label === choice.label) === index
+    );
+    const hasInjectedMetaMask = injectedChoices.some((choice) => choice.label === 'MetaMask');
+    const hasInjectedPhantom = injectedChoices.some((choice) => /phantom/i.test(choice.label));
+
     return (
       <section className="direct-swap mobile-connect-card">
         <div className="swap-heading">
-          <strong>CONNECT WALLET</strong>
-          <span>One tap on desktop or mobile. We find the leftovers; $CUCK stays locked as the output.</span>
+          <strong>CHOOSE WALLET</strong>
+          <span>Pick the wallet that holds the bag you want to recycle.</span>
         </div>
 
-        <button
-          type="button"
-          className="direct-recycle mobile-connect-button"
-          onClick={connectUniversal}
-          disabled={state === 'connecting'}
-        >
-          {state === 'connecting' ? 'OPENING WALLET…' : 'CONNECT WALLET'}
-        </button>
+        <div className="wallet-choice-grid">
+          {injectedChoices.map((choice) => (
+            <button
+              type="button"
+              className="wallet-choice-button"
+              key={choice.label}
+              onClick={() => connectChoice(choice)}
+            >
+              <b>{choice.label}</b>
+              <small>Connect this wallet</small>
+            </button>
+          ))}
+
+          {!hasInjectedMetaMask ? (
+            <button
+              type="button"
+              className="wallet-choice-button"
+              onClick={connectMetaMask}
+              disabled={state === 'connecting'}
+            >
+              <b>MetaMask</b>
+              <small>{state === 'connecting' ? 'Opening…' : 'Mobile / extension'}</small>
+            </button>
+          ) : null}
+
+          {!hasInjectedPhantom ? (
+            <button
+              type="button"
+              className="wallet-choice-button"
+              onClick={openCurrentDappInPhantom}
+            >
+              <b>Phantom</b>
+              <small>Open this swap in Phantom</small>
+            </button>
+          ) : null}
+        </div>
 
         <small className="mobile-connect-help">
-          On iPhone this opens MetaMask and returns you to the swap after approval.
+          We never choose a wallet for you.
         </small>
 
         {error ? <div className="factory-finish-error">{error}</div> : null}
@@ -1302,7 +1332,32 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
         <span>{token.chainLabel} → $CUCK on Robinhood. One quote, one wallet transaction.</span>
       </div>
 
-      <div className="direct-wallet">✓ {shortAddress(account)} · {token.chainLabel}</div>
+      <div className="direct-wallet">✓ {shortAddress(account)} · {walletLabel || 'Connected wallet'}</div>
+
+      <div className="bag-picker">
+        <span>YOUR BAGS</span>
+        {holdingsLoading ? <small>Scanning wallet…</small> : null}
+
+        {holdings.length ? (
+          <div className="bag-picker-list">
+            {holdings.slice(0, 8).map((item) => (
+              <button
+                type="button"
+                key={item.id}
+                className={item.id === token.id ? 'active' : ''}
+                onClick={() => onSelectHolding?.(item)}
+              >
+                <b>{item.symbol}</b>
+                <small>{item.usd > 0 ? money(item.usd) : item.chainLabel}</small>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <small>
+            {holdingsError ? 'Other bags could not be scanned. Showing Robinhood ETH directly.' : 'Robinhood ETH is available directly while we scan for other bags.'}
+          </small>
+        )}
+      </div>
 
       <div className="direct-grid">
         <div className="direct-token-card"><span>FROM</span><strong>{token.symbol}</strong><small>{token.chainLabel}</small></div>
@@ -1312,6 +1367,11 @@ function DirectEvmCuckSwap({ destination, wallet, sourceToken, onWalletConnected
       <label className="direct-amount">
         <span>AMOUNT</span>
         <div><input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" /><b>{token.symbol}</b></div>
+        <small className="available-balance">
+          AVAILABLE: {Number(token.balance || 0).toLocaleString('en-US', { maximumFractionDigits: 8 })} {token.symbol}
+          {token.usd > 0 ? ` · ${money(token.usd)}` : ''}
+          {isNative ? ' · MAX keeps 5% for gas' : ''}
+        </small>
       </label>
 
       <div className="direct-percent-row">
@@ -1466,7 +1526,7 @@ function SwapWidget({ destination, sourceToken, sourceForm, onQuote, onCompleted
         onSourceSelected={onSourceSelected}
       />
 
-      <LiFiWidget integrator="cuck-factory-bag-recycler" config={widgetConfig} />
+      <LiFiWidget integrator="cuckfactory" config={widgetConfig} />
 
       <div className="swap-promise">
         <span>$CUCK stays yours.</span>
@@ -1529,7 +1589,7 @@ function DirectLiFiQuoteFallback({
           fromAddress: wallet,
           toAddress: recipient,
           slippage: '0.03',
-          integrator: 'cuck-factory-bag-recycler',
+          integrator: 'cuckfactory',
         });
 
         const response = await fetch(`https://li.quest/v1/quote?${params.toString()}`);
@@ -2145,20 +2205,16 @@ function App() {
             <b>+$CUCKDROP VALUE</b>
           </div>
 
-          <WalletHoldings
-            holdings={holdings}
-            loading={holdingsLoading}
-            error={holdingsError}
-            connected={isEvmAddress(wallets.evmAddress) || looksLikeSolanaAddress(wallets.solanaAddress)}
-            onRecycle={handleHoldingSelected}
-            selected={selectedHolding}
-          />
 
           <div id="swap-widget">
             <DirectEvmCuckSwap
               destination={destination}
               wallet={wallets.evmAddress}
               sourceToken={selectedHolding && Number(selectedHolding.chainId) !== Number(ALCHEMY_NETWORKS['sol-mainnet'].chainId) ? selectedHolding : null}
+              holdings={holdings.filter((item) => Number(item.chainId) !== Number(ALCHEMY_NETWORKS['sol-mainnet'].chainId))}
+              holdingsLoading={holdingsLoading}
+              holdingsError={holdingsError}
+              onSelectHolding={handleHoldingSelected}
               onWalletConnected={handleWalletConnected}
               onQuote={setQuote}
               onFinished={handleFactoryFinished}
