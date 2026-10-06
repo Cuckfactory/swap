@@ -689,20 +689,47 @@ function EmployeeLine({ destination, employeeId }) {
 }
 
 function RobinhoodDirectSwap({ destination, sourceToken, onQuote, onFinished, onWalletConnected, onUseCrossChain }) {
-  const token = sourceToken;
+  const fallbackToken = {
+    id: 'robinhood-native-eth',
+    chainId: CUCK.chainId,
+    chainLabel: 'Robinhood Chain',
+    tokenAddress: ROUTING.robinhoodNativeToken,
+    symbol: 'ETH',
+    name: 'Ethereum',
+    decimals: 18,
+    balance: 0,
+    rawBalance: '0',
+    usd: 0,
+  };
+  const token = sourceToken && Number(sourceToken.chainId) === CUCK.chainId ? sourceToken : fallbackToken;
+
   const [account, setAccount] = useState('');
   const [amount, setAmount] = useState('');
   const [balanceRaw, setBalanceRaw] = useState(0n);
-  const [route, setRoute] = useState(null);
-  const [cuckDecimals, setCuckDecimals] = useState(18);
+  const [quote, setDirectQuote] = useState(null);
   const [state, setState] = useState('idle');
   const [error, setError] = useState('');
 
-  const tokenAddress = token?.tokenAddress || ROUTING.robinhoodNativeToken;
-  const tokenDecimals = token?.decimals ?? 18;
+  const tokenAddress = token.tokenAddress || ROUTING.robinhoodNativeToken;
+  const tokenDecimals = token.decimals ?? 18;
+  const recipient = isEvmAddress(destination) ? destination : account;
   const humanBalance = Number(formatUnits(balanceRaw.toString(), tokenDecimals, 10));
+  const isNative = sameAddress(tokenAddress, ROUTING.robinhoodNativeToken) || sameAddress(tokenAddress, ROUTING.kyberNativeToken);
+
+  const loadBalance = async (address, prefill = false) => {
+    if (!isEvmAddress(address)) return;
+    const balance = await robinhoodTokenBalance(address, tokenAddress);
+    if (!balance) return;
+    setBalanceRaw(balance.raw);
+    const human = Number(formatUnits(balance.raw.toString(), balance.decimals ?? tokenDecimals, 10));
+    if (prefill && human > 0) {
+      const usable = isNative ? human * 0.95 : human;
+      setAmount(String(Number(usable.toPrecision(10))));
+    }
+  };
 
   const connect = async () => {
+    setError('');
     try {
       const provider = window.ethereum;
       if (!provider?.request) throw new Error('No EVM wallet detected.');
@@ -712,9 +739,7 @@ function RobinhoodDirectSwap({ destination, sourceToken, onQuote, onFinished, on
       if (!isEvmAddress(address)) throw new Error('No EVM wallet connected.');
       setAccount(address);
       onWalletConnected?.({ address });
-      const bal = await robinhoodTokenBalance(address, tokenAddress);
-      if (bal) setBalanceRaw(bal.raw);
-      setError('');
+      await loadBalance(address, !amount);
       return address;
     } catch (err) {
       setError(err?.message || 'Wallet connection failed.');
@@ -723,133 +748,253 @@ function RobinhoodDirectSwap({ destination, sourceToken, onQuote, onFinished, on
   };
 
   useEffect(() => {
-    setAmount('');
-    setRoute(null);
+    let cancelled = false;
+    const provider = window.ethereum;
+    if (!provider?.request) return () => { cancelled = true; };
+    Promise.all([
+      provider.request({ method: 'eth_accounts' }).catch(() => []),
+      provider.request({ method: 'eth_chainId' }).catch(() => ''),
+    ]).then(async ([accounts, chainHex]) => {
+      if (cancelled) return;
+      const address = accounts?.[0] || '';
+      const chainId = Number.parseInt(String(chainHex || '0x0'), 16);
+      if (isEvmAddress(address) && chainId === CUCK.chainId) {
+        setAccount(address);
+        onWalletConnected?.({ address });
+        await loadBalance(address, !amount);
+      }
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    setDirectQuote(null);
     setState('idle');
     setError('');
-    if (token?.rawBalance) {
-      try { setBalanceRaw(BigInt(token.rawBalance)); } catch { setBalanceRaw(0n); }
-    } else setBalanceRaw(0n);
-  }, [token?.id]);
+    if (token?.rawBalance && token.rawBalance !== '0') {
+      try {
+        const raw = BigInt(token.rawBalance);
+        setBalanceRaw(raw);
+        if (!amount) {
+          const human = Number(formatUnits(raw.toString(), tokenDecimals, 10));
+          const usable = isNative ? human * 0.95 : human;
+          if (usable > 0) setAmount(String(Number(usable.toPrecision(10))));
+        }
+      } catch {}
+    } else if (account) {
+      loadBalance(account, !amount);
+    }
+  }, [token.id]);
 
   useEffect(() => {
     const numeric = Number(amount || 0);
-    if (!token || !numeric || numeric <= 0) {
-      setRoute(null);
-      setState('idle');
+    if (!isEvmAddress(account) || !isEvmAddress(recipient) || !numeric || numeric <= 0) {
+      setDirectQuote(null);
+      if (state !== 'executing' && state !== 'done') setState('idle');
       return;
     }
+
     let cancelled = false;
     const timer = window.setTimeout(async () => {
       setState('quoting');
       setError('');
+      setDirectQuote(null);
+
       try {
-        const raw = decimalToRaw(amount, tokenDecimals);
-        const [found, cDec, directUsd] = await Promise.all([
-          findBestFactoryRoute(tokenAddress, raw),
-          evmTokenDecimals(CUCK.address),
-          quoteRobinhoodUsd(tokenAddress, raw),
-        ]);
-        if (cancelled) return;
-        setCuckDecimals(cDec);
-        if (!found) {
-          setRoute(null);
-          setState('no-route');
-          setError('No Robinhood liquidity path to $CUCK for this amount yet.');
-          return;
+        const rawAmount = decimalToRaw(amount, tokenDecimals);
+        const params = new URLSearchParams({
+          fromChain: String(CUCK.chainId),
+          toChain: String(CUCK.chainId),
+          fromToken: tokenAddress,
+          toToken: CUCK.address,
+          fromAmount: rawAmount,
+          fromAddress: account,
+          toAddress: recipient,
+          slippage: '0.03',
+          integrator: 'cuck-factory-bag-recycler',
+        });
+
+        const response = await fetch(`https://li.quest/v1/quote?${params.toString()}`);
+        const body = await response.json().catch(() => null);
+        if (!response.ok || !body?.transactionRequest) {
+          const message = body?.message || body?.error?.message || `LI.FI quote failed (${response.status})`;
+          throw new Error(message);
         }
-        setRoute(found);
+        if (cancelled) return;
+
+        setDirectQuote(body);
         setState('ready');
-        const proportionalUsd = token.usd > 0 && token.balance > 0 ? token.usd * (numeric / token.balance) : 0;
-        const fromUsd = directUsd || proportionalUsd;
-        onQuote?.({ fromUsd, toUsd: fromUsd });
+
+        const fromPrice = Number(body?.action?.fromToken?.priceUSD || 0);
+        const fromUsd = fromPrice > 0
+          ? fromPrice * numeric
+          : (token.usd > 0 && token.balance > 0 ? token.usd * (numeric / token.balance) : 0);
+        const toDecimals = body?.action?.toToken?.decimals ?? 18;
+        const toHuman = Number(formatUnits(body?.estimate?.toAmount || '0', toDecimals, 10));
+        const toPrice = Number(body?.action?.toToken?.priceUSD || 0);
+        const toUsd = toPrice > 0 ? toPrice * toHuman : fromUsd;
+        onQuote?.({ fromUsd, toUsd });
       } catch (err) {
         if (cancelled) return;
-        setRoute(null);
         setState('error');
-        const message = err?.message || 'Route check failed.';
-        setError(message.includes('READ_RPC_')
-          ? 'Could not read Robinhood right now. Reconnect the wallet and try again.'
-          : message);
+        setError(err?.message || 'No direct LI.FI quote found.');
       }
-    }, 300);
-    return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [amount, token?.id, tokenAddress, tokenDecimals]);
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [amount, account, recipient, tokenAddress, tokenDecimals, token.id]);
+
+  const toRpcQuantity = (value, fallback = '0x0') => {
+    if (value === undefined || value === null || value === '') return fallback;
+    const text = String(value);
+    if (/^0x[0-9a-f]+$/i.test(text)) return text;
+    try { return `0x${BigInt(text).toString(16)}`; } catch { return fallback; }
+  };
 
   const execute = async () => {
-    if (!token || !route) return;
-    const wallet = account || await connect();
-    if (!wallet) return;
+    if (!quote?.transactionRequest) return;
+    let wallet = account;
+    if (!isEvmAddress(wallet)) wallet = await connect();
+    if (!isEvmAddress(wallet)) return;
+
     setState('executing');
     setError('');
+
     try {
-      const recipient = isEvmAddress(destination) ? destination : wallet;
-      const before = await cuckBalance(recipient);
-      const raw = decimalToRaw(amount, tokenDecimals);
-      const execution = await executeFactoryDirect({
-        tokenAddress,
-        amountInRaw: raw,
-        recipient,
-        expectedSourceAccount: wallet,
-      });
-      const after = await cuckBalance(recipient);
-      const beforeRaw = before?.raw ?? 0n;
-      const afterRaw = after?.raw ?? 0n;
-      const diff = afterRaw > beforeRaw ? afterRaw - beforeRaw : execution.quotedOut;
-      const decimals = after?.decimals ?? before?.decimals ?? cuckDecimals;
-      const directUsd = await quoteRobinhoodUsd(tokenAddress, raw);
-      const proportionalUsd = token.usd > 0 && token.balance > 0 ? token.usd * (Number(amount) / token.balance) : 0;
-      const fromUsd = directUsd || proportionalUsd;
+      const provider = window.ethereum;
+      await ensureRobinhoodWallet(provider);
+
+      const approvalAddress = quote?.estimate?.approvalAddress;
+      if (!isNative && isEvmAddress(approvalAddress)) {
+        const rawAmount = BigInt(decimalToRaw(amount, tokenDecimals));
+        const allowance = await erc20Allowance(tokenAddress, wallet, approvalAddress);
+        if (allowance < rawAmount) {
+          await approveErc20(provider, wallet, tokenAddress, approvalAddress, rawAmount);
+        }
+      }
+
+      const req = quote.transactionRequest;
+      const tx = {
+        from: wallet,
+        to: req.to,
+        data: req.data || '0x',
+        value: toRpcQuantity(req.value, '0x0'),
+      };
+      if (req.gasLimit || req.gas) tx.gas = toRpcQuantity(req.gasLimit || req.gas);
+      if (req.gasPrice) tx.gasPrice = toRpcQuantity(req.gasPrice);
+      if (req.maxFeePerGas) tx.maxFeePerGas = toRpcQuantity(req.maxFeePerGas);
+      if (req.maxPriorityFeePerGas) tx.maxPriorityFeePerGas = toRpcQuantity(req.maxPriorityFeePerGas);
+
+      const txHash = await provider.request({ method: 'eth_sendTransaction', params: [tx] });
+      await waitForReceipt(txHash);
+
+      const toDecimals = quote?.action?.toToken?.decimals ?? 18;
+      const toAmount = quote?.estimate?.toAmount || '0';
+      const fromPrice = Number(quote?.action?.fromToken?.priceUSD || 0);
+      const fromUsd = fromPrice > 0
+        ? fromPrice * Number(amount || 0)
+        : (token.usd > 0 && token.balance > 0 ? token.usd * (Number(amount || 0) / token.balance) : 0);
+      const toHuman = Number(formatUnits(toAmount, toDecimals, 10));
+      const toPrice = Number(quote?.action?.toToken?.priceUSD || 0);
+      const toUsd = toPrice > 0 ? toPrice * toHuman : fromUsd;
+
       onFinished?.({
         fromUsd,
-        toUsd: fromUsd,
-        cuckAmount: formatUnits(diff.toString(), decimals, 4),
+        toUsd,
+        cuckAmount: formatUnits(toAmount, toDecimals, 4),
         fromSymbol: token.symbol || 'TOKEN',
         fromAmount: amount,
         destination: recipient,
-        finishTxHash: execution.txHash,
+        txHash,
       });
       setState('done');
+      await loadBalance(wallet, false);
     } catch (err) {
       setState('error');
-      setError(err?.message || 'Recycle failed.');
+      setError(err?.message || 'Swap failed.');
     }
   };
 
-  const maxAmount = humanBalance || Number(token?.balance || 0);
+  const maxAmount = humanBalance || Number(token.balance || 0);
   const setPct = (pct) => {
     if (!maxAmount) return;
     let value = maxAmount * pct;
-    // Native ETH needs a little left behind for gas.
-    if (sameAddress(tokenAddress, ROUTING.robinhoodNativeToken) && pct >= 1) value = maxAmount * 0.97;
-    setAmount(String(Number(value.toPrecision(8))));
+    if (isNative && pct >= 1) value = maxAmount * 0.95;
+    setAmount(String(Number(value.toPrecision(10))));
   };
 
-  if (!token) return null;
-  const quotedCuck = route ? formatUnits(route.amountOut.toString(), cuckDecimals, 4) : '—';
+  const toDecimals = quote?.action?.toToken?.decimals ?? 18;
+  const expectedCuck = quote ? formatUnits(quote?.estimate?.toAmount || '0', toDecimals, 4) : '—';
+  const routeName = quote?.toolDetails?.name || quote?.tool || 'LI.FI';
 
   return (
-    <section className="direct-swap">
+    <section className="direct-swap primary-swap">
       <div className="swap-heading">
-        <strong>RECYCLE ${token.symbol}</strong>
-        <span>The Factory routes it on Robinhood and your wallet receives $CUCK.</span>
+        <strong>RECYCLE</strong>
+        <span>Robinhood bag → $CUCK in one swap.</span>
       </div>
-      <div className="direct-route-badge">ROBINHOOD DIRECT · FINAL OUTPUT $CUCK</div>
+
+      {!account ? (
+        <button type="button" className="direct-connect" onClick={connect}>CONNECT WALLET</button>
+      ) : (
+        <div className="direct-wallet">✓ {shortAddress(account)} · Robinhood Chain</div>
+      )}
+
       <div className="direct-grid">
-        <div className="direct-token-card"><span>FROM</span><strong>{token.symbol}</strong><small>Robinhood Chain</small></div>
-        <div className="direct-token-card output"><span>TO</span><strong>$CUCK</strong><small>Robinhood Chain</small></div>
+        <div className="direct-token-card">
+          <span>FROM</span>
+          <strong>{token.symbol}</strong>
+          <small>Robinhood Chain</small>
+        </div>
+        <div className="direct-token-card output">
+          <span>TO</span>
+          <strong>$CUCK</strong>
+          <small>Robinhood Chain · locked</small>
+        </div>
       </div>
-      <label className="direct-amount"><span>AMOUNT</span><div><input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" /><b>{token.symbol}</b></div></label>
-      {maxAmount > 0 ? <div className="direct-percent-row"><button type="button" onClick={() => setPct(.25)}>25%</button><button type="button" onClick={() => setPct(.5)}>50%</button><button type="button" onClick={() => setPct(.75)}>75%</button><button type="button" onClick={() => setPct(1)}>MAX</button></div> : null}
-      <div className="direct-quote"><span>YOU RECEIVE</span><strong>{state === 'quoting' ? 'CHECKING…' : route ? `≈ ${quotedCuck} $CUCK` : '— $CUCK'}</strong>{route ? <small>Factory route found ✓</small> : null}</div>
+
+      <label className="direct-amount">
+        <span>AMOUNT</span>
+        <div>
+          <input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" />
+          <b>{token.symbol}</b>
+        </div>
+      </label>
+
+      {maxAmount > 0 ? (
+        <div className="direct-percent-row">
+          <button type="button" onClick={() => setPct(.25)}>25%</button>
+          <button type="button" onClick={() => setPct(.5)}>50%</button>
+          <button type="button" onClick={() => setPct(.75)}>75%</button>
+          <button type="button" onClick={() => setPct(1)}>MAX</button>
+        </div>
+      ) : null}
+
+      <div className="direct-quote">
+        <span>YOU RECEIVE</span>
+        <strong>{state === 'quoting' ? 'CHECKING…' : quote ? `≈ ${expectedCuck} $CUCK` : '— $CUCK'}</strong>
+        {quote ? <small>Route found via {routeName} ✓</small> : null}
+      </div>
+
       {error ? <div className="factory-finish-error">{error}</div> : null}
-      <button type="button" className="direct-recycle" onClick={execute} disabled={!route || state === 'quoting' || state === 'executing' || state === 'done'}>{state === 'executing' ? 'RECYCLING…' : state === 'done' ? 'BAG RECYCLED ✓' : 'RECYCLE → $CUCK'}</button>
+
+      <button
+        type="button"
+        className="direct-recycle"
+        onClick={account ? execute : connect}
+        disabled={!!account && (!quote || state === 'quoting' || state === 'executing' || state === 'done')}
+      >
+        {!account ? 'CONNECT WALLET' : state === 'executing' ? 'SWAPPING…' : state === 'done' ? 'RECYCLED ✓' : 'SWAP → $CUCK'}
+      </button>
+
       <button type="button" className="direct-other" onClick={onUseCrossChain}>TOKEN ON ANOTHER CHAIN? →</button>
-      <small className="direct-note">USDG / HOOD may be used under the hood, but they are never your final asset.</small>
+      <small className="direct-note">Direct LI.FI quote. No hidden ETH bridge and no second transaction.</small>
     </section>
   );
 }
-
 function SwapWidget({ destination, sourceToken, sourceForm, onQuote, onCompleted, onStarted, onWalletConnected, onRoutes, onFormChanged, onSourceSelected }) {
   const lockedDestination = isEvmAddress(destination);
   const outputToken = CUCK.address;
@@ -882,12 +1027,6 @@ function SwapWidget({ destination, sourceToken, sourceForm, onQuote, onCompleted
         to: { allow: [CUCK.chainId] },
       },
 
-      tokens: {
-        to: {
-          allow: [{ chainId: CUCK.chainId, address: CUCK.address }],
-        },
-      },
-
       // CUCK remains visible, but the user cannot change it.
       disabledUI: {
         toToken: true,
@@ -915,15 +1054,9 @@ function SwapWidget({ destination, sourceToken, sourceForm, onQuote, onCompleted
         }],
       },
 
-      // Nordstern is the working Robinhood liquidity source. Jupiter keeps
-      // Solana-source swaps available as well.
-      exchanges: {
-        allow: ['nordstern', 'jupiter'],
-      },
-
       // New keyPrefix prevents old per-user widget exchange settings from
       // carrying over from earlier test builds.
-      keyPrefix: 'cuck-bag-recycler-v17',
+      keyPrefix: 'cuck-bag-recycler-v18',
 
       showSingleRoute: true,
       routePriority: 'RECOMMENDED',
@@ -1510,7 +1643,7 @@ function App() {
     setRouteState('idle');
     setGatewayResult(null);
     setResult(null);
-    setCrossChainMode(false);
+    setCrossChainMode(Number(holding.chainId) !== CUCK.chainId);
     setSourceForm({
       chainId: holding.chainId,
       tokenAddress: holding.tokenAddress,
@@ -1678,34 +1811,51 @@ function App() {
           />
 
           <div id="swap-widget">
-            <SwapWidget
-              destination={destination}
-              sourceToken={selectedHolding}
-              sourceForm={sourceForm}
-              onQuote={handleQuote}
-              onStarted={handleStarted}
-              onCompleted={handleCompleted}
-              onWalletConnected={handleWalletConnected}
-              onRoutes={handleRoutes}
-              onFormChanged={handleFormChanged}
-              onSourceSelected={handleSourceSelected}
-            />
-
-            {routeState === 'no-route' && Number(sourceForm.chainId) === CUCK.chainId ? (
-              <DirectLiFiQuoteFallback
-                sourceForm={sourceForm}
-                wallet={wallets.evmAddress}
+            {!crossChainMode ? (
+              <RobinhoodDirectSwap
                 destination={destination}
-                selectedHolding={selectedHolding}
-                onFinished={handleCompletedFallback => {
-                  setResult(handleCompletedFallback);
-                  setStatus('done');
-                  window.setTimeout(() => {
-                    document.getElementById('success')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                  }, 120);
+                sourceToken={selectedHolding}
+                onQuote={(liveQuote) => setQuote(liveQuote)}
+                onFinished={handleFactoryFinished}
+                onWalletConnected={handleWalletConnected}
+                onUseCrossChain={() => {
+                  setCrossChainMode(true);
+                  setSelectedHolding(null);
+                  setSourceForm({ chainId: null, tokenAddress: '', fromAmount: '' });
+                  setQuote(null);
+                  setResult(null);
                 }}
               />
-            ) : null}
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="direct-other crosschain-back"
+                  onClick={() => {
+                    setCrossChainMode(false);
+                    setSelectedHolding(null);
+                    setSourceForm({ chainId: CUCK.chainId, tokenAddress: ROUTING.robinhoodNativeToken, fromAmount: '' });
+                    setQuote(null);
+                    setResult(null);
+                  }}
+                >
+                  ← BACK TO ROBINHOOD DIRECT
+                </button>
+
+                <SwapWidget
+                  destination={destination}
+                  sourceToken={selectedHolding}
+                  sourceForm={sourceForm}
+                  onQuote={handleQuote}
+                  onStarted={handleStarted}
+                  onCompleted={handleCompleted}
+                  onWalletConnected={handleWalletConnected}
+                  onRoutes={handleRoutes}
+                  onFormChanged={handleFormChanged}
+                  onSourceSelected={handleSourceSelected}
+                />
+              </>
+            )}
           </div>
         </section>
 
