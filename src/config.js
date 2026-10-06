@@ -59,9 +59,10 @@ export const ROUTING = {
   kyberSwapUrl: 'https://kyberswap.com/swap/robinhood',
   kyberClientId: 'cuck-factory-bag-recycler',
   // Browser-side reads: keyless, read-only and explicitly CORS-enabled.
-  robinhoodReadRpc: 'https://triport.io/rpc/robinhood/public',
+  robinhoodReadRpc: 'https://rpc.mainnet.chain.robinhood.com',
   // Wallet network configuration / transaction submission remains on Robinhood's official RPC.
   robinhoodWalletRpc: 'https://rpc.mainnet.chain.robinhood.com',
+  robinhoodFallbackRpc: 'https://triport.io/rpc/robinhood/public',
   // Backwards-compatible alias for older code paths.
   robinhoodRpc: 'https://triport.io/rpc/robinhood/public',
 };
