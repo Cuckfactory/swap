@@ -344,3 +344,14 @@ main{width:min(900px,calc(100% - 32px));padding-top:34px}
   .change-wallet-button{font-size:9px;padding-top:2px}
   .scan-status{font-size:11px}
 }
+
+
+/* V24 mobile confirmation + bag balances */
+.bag-picker-list button{min-height:66px}
+.bag-picker-list small{line-height:1.35;text-align:left}
+.scan-warning{display:block;margin-top:8px;padding:8px;border:1px solid #7d4e25;background:#170b07;color:#d7a36d!important;font-size:9px!important;line-height:1.4}
+@media(max-width:680px){
+  .bag-picker-list button{min-height:72px}
+  .bag-picker-list b{font-size:18px}
+  .bag-picker-list small{font-size:9px}
+}
